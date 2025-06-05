@@ -26,8 +26,10 @@ import pandas as pd
 from torch.utils.data import Dataset, DataLoader, Subset
 import torch.optim as optim
 import torch.nn as nn
-from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score
+from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score, confusion_matrix, roc_curve, auc
 from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import label_binarize
+import seaborn as sns
 
 # Set page config as the FIRST Streamlit command
 st.set_page_config(page_title="XrayScan AI", layout="centered", page_icon="🔍")
@@ -106,6 +108,7 @@ class KneeXrayDataset(Dataset):
                 raise FileNotFoundError(f"Dataset directory not found at: {root_dir}")
             self.transform = transform
             self.label_map = {"0Normal": 0, "1Doubtful": 1, "2Mild": 2, "3Moderate": 3, "4Severe": 4}
+            self.classes = ["0Normal", "1Doubtful", "2Mild", "3Moderate", "4Severe"]
 
             # Construct list of (image_path, label) pairs
             self.image_label_pairs = []
@@ -147,7 +150,7 @@ class KneeXrayDataset(Dataset):
             if self.transform:
                 image = self.transform(image)
 
-            return image, label
+            return image, label, img_path  # Return image path for prediction results
         except Exception as e:
             st.error(f"Error loading item {idx}: {str(e)}")
             raise
@@ -168,17 +171,23 @@ def load_knee_xray_dataset():
         
         train_loader = DataLoader(train_dataset, batch_size=16, shuffle=True)
         val_loader = DataLoader(val_dataset, batch_size=16, shuffle=False)
+        full_loader = DataLoader(dataset, batch_size=16, shuffle=False)  # Loader for the whole dataset
         
-        return train_loader, val_loader, len(dataset), len(train_dataset), len(val_dataset)
+        return train_loader, val_loader, full_loader, len(dataset), len(train_dataset), len(val_dataset), dataset.classes
     except Exception as e:
         st.error(f"Failed to load dataset: {str(e)}")
-        return None, None, 0, 0, 0
+        return None, None, None, 0, 0, 0, None
 
 # Train CNN model and compute evaluation metrics
-def train_cnn_model(model, train_loader, val_loader, epochs=1, verbose=True):
+def train_cnn_model(model, train_loader, val_loader, full_loader, classes, epochs=1, verbose=True):
     try:
         criterion = nn.CrossEntropyLoss()
         optimizer = optim.Adam(model.parameters(), lr=0.001)
+        
+        # Track batch-wise accuracy for plotting
+        batch_accuracies = []
+        batch_numbers = []
+        batch_idx = 0
         
         for epoch in range(epochs):
             # Training phase
@@ -187,7 +196,7 @@ def train_cnn_model(model, train_loader, val_loader, epochs=1, verbose=True):
             correct = 0
             total = 0
 
-            for i, (images, labels) in enumerate(train_loader):
+            for i, (images, labels, _) in enumerate(train_loader):
                 try:
                     images, labels = images.to(device), labels.to(device)
 
@@ -202,9 +211,15 @@ def train_cnn_model(model, train_loader, val_loader, epochs=1, verbose=True):
                     total += labels.size(0)
                     correct += (predicted == labels).sum().item()
 
+                    # Track batch accuracy
+                    batch_acc = 100 * correct / total
+                    batch_accuracies.append(batch_acc)
+                    batch_numbers.append(batch_idx)
+                    batch_idx += 1
+
                     if verbose and (i + 1) % 10 == 0:  # Print every 10 batches
                         st.write(f"Epoch [{epoch+1}/{epochs}], Batch [{i+1}/{len(train_loader)}], "
-                                 f"Loss: {running_loss / (i+1):.4f}, Accuracy: {100 * correct / total:.2f}%")
+                                 f"Loss: {running_loss / (i+1):.4f}, Accuracy: {batch_acc:.2f}%")
                 except Exception as e:
                     st.error(f"Error during training batch {i+1}: {str(e)}")
                     raise
@@ -214,20 +229,35 @@ def train_cnn_model(model, train_loader, val_loader, epochs=1, verbose=True):
             if verbose:
                 st.write(f"End of Epoch [{epoch+1}/{epochs}], Training Loss: {epoch_loss:.4f}, Training Accuracy: {epoch_acc:.2f}%")
 
+            # Plot accuracy curve
+            plt.figure(figsize=(10, 5))
+            plt.plot(batch_numbers, batch_accuracies, label="Batch Accuracy")
+            plt.xlabel("Batch Number")
+            plt.ylabel("Accuracy (%)")
+            plt.title(f"Training Accuracy Curve (Epoch {epoch+1})")
+            plt.legend()
+            st.pyplot(plt)
+            plt.close()
+
             # Validation phase
             model.eval()
             val_predictions = []
             val_labels = []
+            val_probabilities = []
+            val_image_paths = []
             
             with torch.no_grad():
-                for images, labels in val_loader:
+                for images, labels, img_paths in val_loader:
                     images, labels = images.to(device), labels.to(device)
                     outputs = model(images)
+                    probabilities = F.softmax(outputs, dim=1)
                     _, predicted = torch.max(outputs.data, 1)
                     val_predictions.extend(predicted.cpu().numpy())
                     val_labels.extend(labels.cpu().numpy())
+                    val_probabilities.extend(probabilities.cpu().numpy())
+                    val_image_paths.extend(img_paths)
             
-            # Compute evaluation metrics
+            # Compute evaluation metrics for validation set
             accuracy = accuracy_score(val_labels, val_predictions)
             precision = precision_score(val_labels, val_predictions, average='weighted', zero_division=0)
             recall = recall_score(val_labels, val_predictions, average='weighted', zero_division=0)
@@ -238,6 +268,74 @@ def train_cnn_model(model, train_loader, val_loader, epochs=1, verbose=True):
             st.write(f"Precision: {precision:.4f}")
             st.write(f"Recall: {recall:.4f}")
             st.write(f"F1 Score: {f1:.4f}\n")
+
+            # Compute and plot confusion matrix
+            cm = confusion_matrix(val_labels, val_predictions)
+            plt.figure(figsize=(8, 6))
+            sns.heatmap(cm, annot=True, fmt="d", cmap="Blues", xticklabels=classes, yticklabels=classes)
+            plt.xlabel("Predicted")
+            plt.ylabel("True")
+            plt.title(f"Confusion Matrix (Epoch {epoch+1})")
+            st.pyplot(plt)
+            plt.close()
+
+            # Compute and plot ROC-AUC curve (multiclass)
+            val_labels_binarized = label_binarize(val_labels, classes=[0, 1, 2, 3, 4])
+            val_probabilities = np.array(val_probabilities)
+            
+            plt.figure(figsize=(10, 6))
+            for i in range(len(classes)):
+                fpr, tpr, _ = roc_curve(val_labels_binarized[:, i], val_probabilities[:, i])
+                roc_auc = auc(fpr, tpr)
+                plt.plot(fpr, tpr, label=f"{classes[i]} (AUC = {roc_auc:.2f})")
+            
+            plt.plot([0, 1], [0, 1], "k--", label="Random Guess")
+            plt.xlabel("False Positive Rate")
+            plt.ylabel("True Positive Rate")
+            plt.title(f"ROC-AUC Curve (Epoch {epoch+1})")
+            plt.legend(loc="best")
+            st.pyplot(plt)
+            plt.close()
+
+            # Display prediction results
+            prediction_results = pd.DataFrame({
+                "Image Path": val_image_paths,
+                "True Label": [classes[label] for label in val_labels],
+                "Predicted Label": [classes[pred] for pred in val_predictions],
+                "Confidence": [max(prob) for prob in val_probabilities]
+            })
+            st.write(f"\nPrediction Results for Validation Set (Epoch {epoch+1}):")
+            st.dataframe(prediction_results.head(10))  # Show top 10 predictions
+
+        # Compute metrics on the whole dataset
+        st.write("\nEvaluating on the entire dataset...")
+        model.eval()
+        full_predictions = []
+        full_labels = []
+        
+        with torch.no_grad():
+            for images, labels, _ in full_loader:
+                images, labels = images.to(device), labels.to(device)
+                outputs = model(images)
+                _, predicted = torch.max(outputs.data, 1)
+                full_predictions.extend(predicted.cpu().numpy())
+                full_labels.extend(labels.cpu().numpy())
+        
+        # Compute evaluation metrics for the whole dataset
+        full_accuracy = accuracy_score(full_labels, full_predictions)
+        full_precision = precision_score(full_labels, full_predictions, average='weighted', zero_division=0)
+        full_recall = recall_score(full_labels, full_predictions, average='weighted', zero_division=0)
+        full_f1 = f1_score(full_labels, full_predictions, average='weighted', zero_division=0)
+        
+        # Display metrics in a clearly labeled section
+        st.subheader("📊 Metrics for the Entire Dataset")
+        st.markdown("""
+        Metrics for the Entire Dataset:  
+        Accuracy: {:.4f}  
+        Precision: {:.4f}  
+        Recall: {:.4f}  
+        F1 Score: {:.4f}
+        """.format(full_accuracy, full_precision, full_recall, full_f1))
 
         # Save the trained model
         torch.save(model.state_dict(), "trained_cnn_model.pth")
@@ -476,7 +574,7 @@ class MedicalPDF(FPDF):
         if self.page_no() > 1:
             self.set_y(-15)
             self.set_font('Helvetica', 'I', 8)
-            self.cell(0, 10, f'Page {self.page_no() - 1} | Generated: {datetime.now().strftime("%Y-%m-%d %H:%M")}', 0, 0, 'C')
+            self.cell(0, 10, f'Page {self.page_no() - 1} | Generated: {datetime.now().strftime("%Y-%m-d %H:%M")}', 0, 0, 'C')
     
     def cover_page(self):
         self.add_page()
@@ -490,7 +588,7 @@ class MedicalPDF(FPDF):
         if self.patient_info:
             self.multi_cell(0, 8, f'Patient Information:\n{self.sanitize_text(self.patient_info)}')
         self.ln(10)
-        self.cell(0, 8, f'Generated on: {datetime.now().strftime("%Y-%m-%d %H:%M")}', 0, 1, 'C')
+        self.cell(0, 8, f'Generated on: {datetime.now().strftime("%Y-%m-d %H:%M")}', 0, 1, 'C')
         self.ln(20)
         self.set_font('Helvetica', 'I', 10)
         self.cell(0, 8, 'For educational purposes only', 0, 1, 'C')
@@ -607,7 +705,7 @@ with st.sidebar:
     st.markdown("Upload clear X-ray images (e.g., chest, bone) in JPG, JPEG, or PNG format.")
     st.divider()
     st.subheader("Dataset Information")
-    train_loader, val_loader, dataset_count, train_count, val_count = load_knee_xray_dataset()
+    train_loader, val_loader, full_loader, dataset_count, train_count, val_count, classes = load_knee_xray_dataset()
     if dataset_count > 0:
         st.write(f"Total images in dataset: {dataset_count}")
         st.write(f"Training images: {train_count}")
@@ -617,12 +715,12 @@ with st.sidebar:
     st.divider()
     st.subheader("Model Training")
     if st.button("Train Model", use_container_width=True, key="train_button"):
-        if train_loader is None or val_loader is None or dataset_count == 0:
+        if train_loader is None or val_loader is None or full_loader is None or dataset_count == 0:
             st.error("Dataset not loaded. Please check the dataset path and CSV file.")
         else:
             with st.spinner("Training model..."):
                 st.write("Starting training with 1 epoch...")
-                train_cnn_model(cnn_model, train_loader, val_loader, epochs=1, verbose=True)
+                train_cnn_model(cnn_model, train_loader, val_loader, full_loader, classes, epochs=1, verbose=True)
                 # Reload the model to use the newly trained weights
                 st.session_state.clear()  # Clear cache to reload model
                 st.rerun()
