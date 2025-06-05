@@ -1,0 +1,75 @@
+/* Base body styling */
+body {
+    font-family: 'Segoe UI', 'Roboto', sans-serif;
+    background-color: #f5f7fa;
+    color: #333;
+}
+
+/* Headings */
+h1, h2, h3, h4, h5 {
+    color: #2c3e50;
+    font-weight: 600;
+}
+
+/* Buttons */
+.stButton > button {
+    background-color: #4CAF50;
+    color: white;
+    padding: 0.6em 1.2em;
+    border: none;
+    border-radius: 8px;
+    font-size: 1rem;
+    transition: 0.3s ease;
+    box-shadow: 0px 2px 5px rgba(0, 0, 0, 0.1);
+}
+
+.stButton > button:hover {
+    background-color: #45a049;
+    transform: scale(1.03);
+}
+
+/* Inputs and TextAreas */
+.stTextInput > div > input,
+.stTextArea > div > textarea {
+    border-radius: 6px;
+    padding: 0.5em;
+    border: 1px solid #ccc;
+    font-size: 1rem;
+}
+
+/* Sidebar */
+.css-6qob1r {
+    background-color: #ffffff;
+    border-right: 1px solid #e1e4e8;
+}
+
+/* Expanders */
+.st-expander {
+    border-radius: 8px;
+    border: 1px solid #dfe3e8;
+    background-color: #fff;
+}
+
+/* Tables and Dataframes */
+.stDataFrame, .stTable {
+    border: 1px solid #e0e0e0;
+    border-radius: 6px;
+}
+
+/* Markdown Text */
+.markdown-text-container {
+    line-height: 1.6;
+}
+@font-face {
+    font-family: 'DejaVu';
+    src: url('fonts/DejaVuSans.ttf') format('truetype');
+}
+body {
+    font-family: 'DejaVu', sans-serif;
+    font-size: 16px;
+    color: #333;
+    padding: 40px;
+}
+h1 {
+    color: #007ACC;
+}
