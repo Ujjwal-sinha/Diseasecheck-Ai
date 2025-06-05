@@ -22,6 +22,12 @@ import re
 from captum.attr import GradientShap
 from lime.lime_image import LimeImageExplainer
 import torch.nn.functional as F
+import pandas as pd
+from torch.utils.data import Dataset, DataLoader, Subset
+import torch.optim as optim
+import torch.nn as nn
+from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score
+from sklearn.model_selection import train_test_split
 
 # Set page config as the FIRST Streamlit command
 st.set_page_config(page_title="XrayScan AI", layout="centered", page_icon="🔍")
@@ -59,8 +65,13 @@ def load_cnn_model():
     try:
         model = models.densenet121(weights="IMAGENET1K_V1")
         model.features.conv0 = torch.nn.Conv2d(1, 64, kernel_size=7, stride=2, padding=3, bias=False)  # Grayscale input
-        model.classifier = torch.nn.Linear(model.classifier.in_features, 4)  # 4 classes
+        model.classifier = torch.nn.Linear(model.classifier.in_features, 5)  # 5 classes for Knee X-ray
         model = model.to(device).eval()
+        
+        # Load trained weights if available
+        if os.path.exists("trained_cnn_model.pth"):
+            model.load_state_dict(torch.load("trained_cnn_model.pth"))
+            st.info("Loaded pre-trained model weights from 'trained_cnn_model.pth'.")
         return model
     except Exception as e:
         st.error(f"Failed to load CNN model: {e}")
@@ -79,6 +90,161 @@ cnn_transform = transforms.Compose([
     transforms.Normalize(mean=[0.5], std=[0.5])
 ])
 
+# Custom Dataset class for Knee X-ray images
+class KneeXrayDataset(Dataset):
+    def __init__(self, csv_file, root_dir, transform=None):
+        try:
+            if not os.path.exists(csv_file):
+                raise FileNotFoundError(f"CSV file not found at: {csv_file}")
+            self.data = pd.read_csv(csv_file)
+            st.write(f"CSV columns: {list(self.data.columns)}")
+            # Check for required columns
+            if 'Parent Directory' not in self.data.columns or 'Subdirectory' not in self.data.columns:
+                raise ValueError("CSV must contain 'Parent Directory' and 'Subdirectory' columns. Found columns: " + str(list(self.data.columns)))
+            self.root_dir = root_dir
+            if not os.path.exists(root_dir):
+                raise FileNotFoundError(f"Dataset directory not found at: {root_dir}")
+            self.transform = transform
+            self.label_map = {"0Normal": 0, "1Doubtful": 1, "2Mild": 2, "3Moderate": 3, "4Severe": 4}
+
+            # Construct list of (image_path, label) pairs
+            self.image_label_pairs = []
+            for idx in range(len(self.data)):
+                parent_dir = self.data.iloc[idx]['Parent Directory']
+                sub_dir = self.data.iloc[idx]['Subdirectory']
+                dir_path = os.path.join(self.root_dir, parent_dir, sub_dir)
+                if not os.path.exists(dir_path):
+                    st.warning(f"Directory not found: {dir_path}")
+                    continue
+                # List all image files in the subdirectory
+                image_files = [f for f in os.listdir(dir_path) if f.lower().endswith(('.jpg', '.jpeg', '.png'))]
+                for image_file in image_files:
+                    image_path = os.path.join(parent_dir, sub_dir, image_file)
+                    label = sub_dir  # Label is the subdirectory name (e.g., "0Normal")
+                    if label not in self.label_map:
+                        st.warning(f"Invalid label {label} for image {image_path}")
+                        continue
+                    self.image_label_pairs.append((image_path, label))
+            if not self.image_label_pairs:
+                raise ValueError("No valid images found in the dataset.")
+            st.write(f"Loaded {len(self.image_label_pairs)} images from the dataset.")
+        except Exception as e:
+            st.error(f"Failed to initialize dataset: {str(e)}")
+            raise
+
+    def __len__(self):
+        return len(self.image_label_pairs)
+
+    def __getitem__(self, idx):
+        try:
+            img_path, label_str = self.image_label_pairs[idx]
+            full_img_path = os.path.join(self.root_dir, img_path)
+            if not os.path.exists(full_img_path):
+                raise FileNotFoundError(f"Image not found at: {full_img_path}")
+            image = Image.open(full_img_path).convert("L")  # Grayscale
+            label = self.label_map[label_str]
+
+            if self.transform:
+                image = self.transform(image)
+
+            return image, label
+        except Exception as e:
+            st.error(f"Error loading item {idx}: {str(e)}")
+            raise
+
+# Load dataset for training and return dataset size
+def load_knee_xray_dataset():
+    try:
+        dataset_path = "Dataset/KneeXray"
+        csv_file = "Dataset/Digital Knee X-ray Images.csv"
+        dataset = KneeXrayDataset(csv_file=csv_file, root_dir=dataset_path, transform=cnn_transform)
+        
+        # Split dataset into training and validation sets (80-20 split)
+        indices = list(range(len(dataset)))
+        train_indices, val_indices = train_test_split(indices, test_size=0.2, random_state=42)
+        
+        train_dataset = Subset(dataset, train_indices)
+        val_dataset = Subset(dataset, val_indices)
+        
+        train_loader = DataLoader(train_dataset, batch_size=16, shuffle=True)
+        val_loader = DataLoader(val_dataset, batch_size=16, shuffle=False)
+        
+        return train_loader, val_loader, len(dataset), len(train_dataset), len(val_dataset)
+    except Exception as e:
+        st.error(f"Failed to load dataset: {str(e)}")
+        return None, None, 0, 0, 0
+
+# Train CNN model and compute evaluation metrics
+def train_cnn_model(model, train_loader, val_loader, epochs=1, verbose=True):
+    try:
+        criterion = nn.CrossEntropyLoss()
+        optimizer = optim.Adam(model.parameters(), lr=0.001)
+        
+        for epoch in range(epochs):
+            # Training phase
+            model.train()
+            running_loss = 0.0
+            correct = 0
+            total = 0
+
+            for i, (images, labels) in enumerate(train_loader):
+                try:
+                    images, labels = images.to(device), labels.to(device)
+
+                    optimizer.zero_grad()
+                    outputs = model(images)
+                    loss = criterion(outputs, labels)
+                    loss.backward()
+                    optimizer.step()
+
+                    running_loss += loss.item()
+                    _, predicted = torch.max(outputs.data, 1)
+                    total += labels.size(0)
+                    correct += (predicted == labels).sum().item()
+
+                    if verbose and (i + 1) % 10 == 0:  # Print every 10 batches
+                        st.write(f"Epoch [{epoch+1}/{epochs}], Batch [{i+1}/{len(train_loader)}], "
+                                 f"Loss: {running_loss / (i+1):.4f}, Accuracy: {100 * correct / total:.2f}%")
+                except Exception as e:
+                    st.error(f"Error during training batch {i+1}: {str(e)}")
+                    raise
+
+            epoch_loss = running_loss / len(train_loader)
+            epoch_acc = 100 * correct / total
+            if verbose:
+                st.write(f"End of Epoch [{epoch+1}/{epochs}], Training Loss: {epoch_loss:.4f}, Training Accuracy: {epoch_acc:.2f}%")
+
+            # Validation phase
+            model.eval()
+            val_predictions = []
+            val_labels = []
+            
+            with torch.no_grad():
+                for images, labels in val_loader:
+                    images, labels = images.to(device), labels.to(device)
+                    outputs = model(images)
+                    _, predicted = torch.max(outputs.data, 1)
+                    val_predictions.extend(predicted.cpu().numpy())
+                    val_labels.extend(labels.cpu().numpy())
+            
+            # Compute evaluation metrics
+            accuracy = accuracy_score(val_labels, val_predictions)
+            precision = precision_score(val_labels, val_predictions, average='weighted', zero_division=0)
+            recall = recall_score(val_labels, val_predictions, average='weighted', zero_division=0)
+            f1 = f1_score(val_labels, val_predictions, average='weighted', zero_division=0)
+            
+            st.write(f"\nValidation Metrics for Epoch [{epoch+1}/{epochs}]:")
+            st.write(f"Accuracy: {accuracy:.4f}")
+            st.write(f"Precision: {precision:.4f}")
+            st.write(f"Recall: {recall:.4f}")
+            st.write(f"F1 Score: {f1:.4f}\n")
+
+        # Save the trained model
+        torch.save(model.state_dict(), "trained_cnn_model.pth")
+        st.success("Training completed and model saved as 'trained_cnn_model.pth'!")
+    except Exception as e:
+        st.error(f"Training failed: {str(e)}")
+
 # X-ray analysis
 def analyze_xray(image: Image.Image, suspected_disease: str = None) -> dict:
     try:
@@ -91,17 +257,17 @@ def analyze_xray(image: Image.Image, suspected_disease: str = None) -> dict:
         # BLIP description
         inputs = processor(images=image_blip, return_tensors="pt").to(device)
         inputs["pixel_values"] = inputs["pixel_values"].to(torch.float32)
-        out = blip_model.generate(**inputs, max_length=150, num_beams=5)
+        out = blip_model.generate(**inputs, max_length=75, num_beams=5)
         description = processor.decode(out[0], skip_special_tokens=True)
 
         # BLIP classification
-        classes = ["Pneumonia", "Tuberculosis", "Fracture", "Normal"]
+        classes = ["0Normal", "1Doubtful", "2Mild", "3Moderate", "4Severe"]
         prompt = f"Classify this X-ray image as one of: {', '.join(classes)}. Description: {description}"
         if suspected_disease and suspected_disease != "None":
             prompt += f" Suspected condition: {suspected_disease}."
         
         classification_inputs = processor(text=prompt, images=image_blip, return_tensors="pt").to(device)
-        classification_out = blip_model.generate(**classification_inputs, max_length=50)
+        classification_out = blip_model.generate(**classification_inputs, max_new_tokens=10)
         blip_predicted_class = processor.decode(classification_out[0], skip_special_tokens=True).strip()
         blip_confidence = 0.9 if blip_predicted_class in classes else 0.5
 
@@ -140,16 +306,16 @@ def apply_gradcam(image_tensor, model, target_class):
         model.zero_grad()
         output[0, target_class].backward()
         
-        gradients = image_tensor.grad.detach()  # Detach gradients
+        gradients = image_tensor.grad.detach()
         weights = torch.mean(gradients, dim=[2, 3], keepdim=True)
         cam = torch.sum(weights * features, dim=1, keepdim=True)
         cam = F.relu(cam)
         cam = F.interpolate(cam, size=(224, 224), mode='bilinear', align_corners=False)
         cam = cam - cam.min()
-        cam = cam / (cam.max() + 1e-8)  # Avoid division by zero
+        cam = cam / (cam.max() + 1e-8)
         
-        cam_np = cam.squeeze().detach().cpu().numpy()  # Detach and convert to NumPy
-        image_np = image_tensor.squeeze().detach().cpu().numpy()  # Detach and convert to NumPy
+        cam_np = cam.squeeze().detach().cpu().numpy()
+        image_np = image_tensor.squeeze().detach().cpu().numpy()
         plt.imshow(image_np, cmap="gray", alpha=0.5)
         plt.imshow(cam_np, cmap="jet", alpha=0.5)
         gradcam_path = f"gradcam_{uuid.uuid4().hex}.png"
@@ -170,8 +336,8 @@ def apply_shap(image_tensor, model):
         image_tensor = image_tensor.clone().detach().requires_grad_(True).to(device)
         attributions = gradient_shap.attribute(image_tensor, baselines=baseline, target=0)
         
-        attr_np = attributions.squeeze().detach().cpu().numpy()  # Detach and convert to NumPy
-        image_np = image_tensor.squeeze().detach().cpu().numpy()  # Detach and convert to NumPy
+        attr_np = attributions.squeeze().detach().cpu().numpy()
+        image_np = image_tensor.squeeze().detach().cpu().numpy()
         plt.imshow(np.abs(attr_np), cmap="viridis", alpha=0.5)
         plt.imshow(image_np, cmap="gray", alpha=0.5)
         shap_path = f"shap_{uuid.uuid4().hex}.png"
@@ -439,6 +605,27 @@ with st.sidebar:
     st.divider()
     st.subheader("Input Guidance")
     st.markdown("Upload clear X-ray images (e.g., chest, bone) in JPG, JPEG, or PNG format.")
+    st.divider()
+    st.subheader("Dataset Information")
+    train_loader, val_loader, dataset_count, train_count, val_count = load_knee_xray_dataset()
+    if dataset_count > 0:
+        st.write(f"Total images in dataset: {dataset_count}")
+        st.write(f"Training images: {train_count}")
+        st.write(f"Validation images: {val_count}")
+    else:
+        st.write("Total images in dataset: 0 (Failed to load dataset)")
+    st.divider()
+    st.subheader("Model Training")
+    if st.button("Train Model", use_container_width=True, key="train_button"):
+        if train_loader is None or val_loader is None or dataset_count == 0:
+            st.error("Dataset not loaded. Please check the dataset path and CSV file.")
+        else:
+            with st.spinner("Training model..."):
+                st.write("Starting training with 1 epoch...")
+                train_cnn_model(cnn_model, train_loader, val_loader, epochs=1, verbose=True)
+                # Reload the model to use the newly trained weights
+                st.session_state.clear()  # Clear cache to reload model
+                st.rerun()
 
 # Image input
 col1, col2 = st.columns([3, 2])
@@ -470,7 +657,7 @@ with st.expander("➕ Additional Clinical Context"):
     )
     suspected_disease = st.selectbox(
         "Suspected Disease (if known)",
-        ["None", "Pneumonia", "Tuberculosis", "Fracture", "Normal"],
+        ["None", "0Normal", "1Doubtful", "2Mild", "3Moderate", "4Severe"],
         help="Select if the X-ray is related to a specific condition."
     )
 
@@ -495,7 +682,7 @@ with col1:
             edge_path = visualize_xray_features(image)
             gradcam_path = apply_gradcam(result["image_tensor"], cnn_model, result["cnn_predicted_idx"])
             shap_path = apply_shap(result["image_tensor"], cnn_model)
-            lime_path = apply_lime(image, cnn_model, ["Pneumonia", "Tuberculosis", "Fracture", "Normal"])
+            lime_path = apply_lime(image, cnn_model, ["0Normal", "1Doubtful", "2Mild", "3Moderate", "4Severe"])
             
             progress_bar.progress(60, text="Correlating with clinical data")
             report = query_langchain(

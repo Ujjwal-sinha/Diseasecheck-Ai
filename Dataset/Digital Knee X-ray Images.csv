@@ -1,0 +1,11 @@
+Parent Directory,Subdirectory,File Count
+MedicalExpert-I,0Normal,514
+MedicalExpert-I,1Doubtful,477
+MedicalExpert-I,2Mild,232
+MedicalExpert-I,3Moderate,221
+MedicalExpert-I,4Severe,206
+MedicalExpert-II,0Normal,503
+MedicalExpert-II,1Doubtful,488
+MedicalExpert-II,2Mild,232
+MedicalExpert-II,3Moderate,221
+MedicalExpert-II,4Severe,206
