@@ -31,21 +31,17 @@ from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import label_binarize
 import seaborn as sns
 
-# Set page config as the FIRST Streamlit command
 st.set_page_config(page_title="XrayScan AI", layout="centered", page_icon="🔍")
 
-# Device setup
 device = torch.device("mps" if torch.backends.mps.is_available() else "cpu")
 st.write(f"Using device: {device}")
 
-# Load environment variables
 load_dotenv()
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 if not GROQ_API_KEY:
     st.error("GROQ_API_KEY missing in .env file. Please configure it.")
     st.stop()
 
-# Cache BLIP models
 @st.cache_resource
 def load_blip_models():
     try:
@@ -61,18 +57,15 @@ if not processor or not blip_model:
     st.error("Critical error: BLIP models failed to load.")
     st.stop()
 
-# Cache CNN model (DenseNet121)
 @st.cache_resource
 def load_cnn_model():
     try:
         model = models.densenet121(weights="IMAGENET1K_V1")
-        model.features.conv0 = torch.nn.Conv2d(1, 64, kernel_size=7, stride=2, padding=3, bias=False)  # Grayscale input
-        model.classifier = torch.nn.Linear(model.classifier.in_features, 5)  # 5 classes for Knee X-ray
+        model.features.conv0 = torch.nn.Conv2d(1, 64, kernel_size=7, stride=2, padding=3, bias=False)
+        model.classifier = torch.nn.Linear(model.classifier.in_features, 5)
         model = model.to(device).eval()
-        
-        # Load trained weights if available
         if os.path.exists("trained_cnn_model.pth"):
-            model.load_state_dict(torch.load("trained_cnn_model.pth"))
+            model.load_state_dict(torch.load("trained_cnn_model.pth", map_location=device))
             st.info("Loaded pre-trained model weights from 'trained_cnn_model.pth'.")
         return model
     except Exception as e:
@@ -84,7 +77,6 @@ if not cnn_model:
     st.error("Critical error: CNN model failed to load.")
     st.stop()
 
-# Image transform for CNN
 cnn_transform = transforms.Compose([
     transforms.Grayscale(num_output_channels=1),
     transforms.Resize((224, 224)),
@@ -92,7 +84,6 @@ cnn_transform = transforms.Compose([
     transforms.Normalize(mean=[0.5], std=[0.5])
 ])
 
-# Custom Dataset class for Knee X-ray images
 class KneeXrayDataset(Dataset):
     def __init__(self, csv_file, root_dir, transform=None):
         try:
@@ -100,17 +91,14 @@ class KneeXrayDataset(Dataset):
                 raise FileNotFoundError(f"CSV file not found at: {csv_file}")
             self.data = pd.read_csv(csv_file)
             st.write(f"CSV columns: {list(self.data.columns)}")
-            # Check for required columns
             if 'Parent Directory' not in self.data.columns or 'Subdirectory' not in self.data.columns:
-                raise ValueError("CSV must contain 'Parent Directory' and 'Subdirectory' columns. Found columns: " + str(list(self.data.columns)))
+                raise ValueError("CSV must contain 'Parent Directory' and 'Subdirectory' columns.")
             self.root_dir = root_dir
             if not os.path.exists(root_dir):
                 raise FileNotFoundError(f"Dataset directory not found at: {root_dir}")
             self.transform = transform
             self.label_map = {"0Normal": 0, "1Doubtful": 1, "2Mild": 2, "3Moderate": 3, "4Severe": 4}
             self.classes = ["0Normal", "1Doubtful", "2Mild", "3Moderate", "4Severe"]
-
-            # Construct list of (image_path, label) pairs
             self.image_label_pairs = []
             for idx in range(len(self.data)):
                 parent_dir = self.data.iloc[idx]['Parent Directory']
@@ -119,11 +107,10 @@ class KneeXrayDataset(Dataset):
                 if not os.path.exists(dir_path):
                     st.warning(f"Directory not found: {dir_path}")
                     continue
-                # List all image files in the subdirectory
                 image_files = [f for f in os.listdir(dir_path) if f.lower().endswith(('.jpg', '.jpeg', '.png'))]
                 for image_file in image_files:
                     image_path = os.path.join(parent_dir, sub_dir, image_file)
-                    label = sub_dir  # Label is the subdirectory name (e.g., "0Normal")
+                    label = sub_dir
                     if label not in self.label_map:
                         st.warning(f"Invalid label {label} for image {image_path}")
                         continue
@@ -144,92 +131,70 @@ class KneeXrayDataset(Dataset):
             full_img_path = os.path.join(self.root_dir, img_path)
             if not os.path.exists(full_img_path):
                 raise FileNotFoundError(f"Image not found at: {full_img_path}")
-            image = Image.open(full_img_path).convert("L")  # Grayscale
+            image = Image.open(full_img_path).convert("L")
             label = self.label_map[label_str]
-
             if self.transform:
                 image = self.transform(image)
-
-            return image, label, img_path  # Return image path for prediction results
+            return image, label, img_path
         except Exception as e:
             st.error(f"Error loading item {idx}: {str(e)}")
             raise
 
-# Load dataset for training and return dataset size
 def load_knee_xray_dataset():
     try:
         dataset_path = "Dataset/KneeXray"
         csv_file = "Dataset/Digital Knee X-ray Images.csv"
         dataset = KneeXrayDataset(csv_file=csv_file, root_dir=dataset_path, transform=cnn_transform)
-        
-        # Split dataset into training and validation sets (80-20 split)
         indices = list(range(len(dataset)))
         train_indices, val_indices = train_test_split(indices, test_size=0.2, random_state=42)
-        
         train_dataset = Subset(dataset, train_indices)
         val_dataset = Subset(dataset, val_indices)
-        
         train_loader = DataLoader(train_dataset, batch_size=16, shuffle=True)
         val_loader = DataLoader(val_dataset, batch_size=16, shuffle=False)
-        full_loader = DataLoader(dataset, batch_size=16, shuffle=False)  # Loader for the whole dataset
-        
+        full_loader = DataLoader(dataset, batch_size=16, shuffle=False)
         return train_loader, val_loader, full_loader, len(dataset), len(train_dataset), len(val_dataset), dataset.classes
     except Exception as e:
         st.error(f"Failed to load dataset: {str(e)}")
         return None, None, None, 0, 0, 0, None
 
-# Train CNN model and compute evaluation metrics
 def train_cnn_model(model, train_loader, val_loader, full_loader, classes, epochs=1, verbose=True):
     try:
         criterion = nn.CrossEntropyLoss()
         optimizer = optim.Adam(model.parameters(), lr=0.001)
-        
-        # Track batch-wise accuracy for plotting
         batch_accuracies = []
         batch_numbers = []
         batch_idx = 0
-        
         for epoch in range(epochs):
-            # Training phase
             model.train()
             running_loss = 0.0
             correct = 0
             total = 0
-
             for i, (images, labels, _) in enumerate(train_loader):
                 try:
                     images, labels = images.to(device), labels.to(device)
-
                     optimizer.zero_grad()
                     outputs = model(images)
                     loss = criterion(outputs, labels)
                     loss.backward()
                     optimizer.step()
-
                     running_loss += loss.item()
                     _, predicted = torch.max(outputs.data, 1)
                     total += labels.size(0)
                     correct += (predicted == labels).sum().item()
-
-                    # Track batch accuracy
                     batch_acc = 100 * correct / total
                     batch_accuracies.append(batch_acc)
                     batch_numbers.append(batch_idx)
                     batch_idx += 1
-
-                    if verbose and (i + 1) % 10 == 0:  # Print every 10 batches
+                    if verbose and (i + 1) % 10 == 0:
                         st.write(f"Epoch [{epoch+1}/{epochs}], Batch [{i+1}/{len(train_loader)}], "
                                  f"Loss: {running_loss / (i+1):.4f}, Accuracy: {batch_acc:.2f}%")
                 except Exception as e:
                     st.error(f"Error during training batch {i+1}: {str(e)}")
                     raise
-
             epoch_loss = running_loss / len(train_loader)
             epoch_acc = 100 * correct / total
             if verbose:
                 st.write(f"End of Epoch [{epoch+1}/{epochs}], Training Loss: {epoch_loss:.4f}, Training Accuracy: {epoch_acc:.2f}%")
-
-            # Plot accuracy curve
             plt.figure(figsize=(10, 5))
             plt.plot(batch_numbers, batch_accuracies, label="Batch Accuracy")
             plt.xlabel("Batch Number")
@@ -238,14 +203,11 @@ def train_cnn_model(model, train_loader, val_loader, full_loader, classes, epoch
             plt.legend()
             st.pyplot(plt)
             plt.close()
-
-            # Validation phase
             model.eval()
             val_predictions = []
             val_labels = []
             val_probabilities = []
             val_image_paths = []
-            
             with torch.no_grad():
                 for images, labels, img_paths in val_loader:
                     images, labels = images.to(device), labels.to(device)
@@ -256,20 +218,15 @@ def train_cnn_model(model, train_loader, val_loader, full_loader, classes, epoch
                     val_labels.extend(labels.cpu().numpy())
                     val_probabilities.extend(probabilities.cpu().numpy())
                     val_image_paths.extend(img_paths)
-            
-            # Compute evaluation metrics for validation set
             accuracy = accuracy_score(val_labels, val_predictions)
             precision = precision_score(val_labels, val_predictions, average='weighted', zero_division=0)
-            recall = recall_score(val_labels, val_predictions, average='weighted', zero_division=0)
-            f1 = f1_score(val_labels, val_predictions, average='weighted', zero_division=0)
-            
+            recall = recall_score(val_labels, val_predictions, average='weighted')
+            f1 = f1_score(val_labels, val_predictions, average='weighted')
             st.write(f"\nValidation Metrics for Epoch [{epoch+1}/{epochs}]:")
             st.write(f"Accuracy: {accuracy:.4f}")
             st.write(f"Precision: {precision:.4f}")
             st.write(f"Recall: {recall:.4f}")
             st.write(f"F1 Score: {f1:.4f}\n")
-
-            # Compute and plot confusion matrix
             cm = confusion_matrix(val_labels, val_predictions)
             plt.figure(figsize=(8, 6))
             sns.heatmap(cm, annot=True, fmt="d", cmap="Blues", xticklabels=classes, yticklabels=classes)
@@ -278,17 +235,13 @@ def train_cnn_model(model, train_loader, val_loader, full_loader, classes, epoch
             plt.title(f"Confusion Matrix (Epoch {epoch+1})")
             st.pyplot(plt)
             plt.close()
-
-            # Compute and plot ROC-AUC curve (multiclass)
             val_labels_binarized = label_binarize(val_labels, classes=[0, 1, 2, 3, 4])
             val_probabilities = np.array(val_probabilities)
-            
-            plt.figure(figsize=(10, 6))
+            plt.figure(figsize=(10, 5))
             for i in range(len(classes)):
                 fpr, tpr, _ = roc_curve(val_labels_binarized[:, i], val_probabilities[:, i])
                 roc_auc = auc(fpr, tpr)
                 plt.plot(fpr, tpr, label=f"{classes[i]} (AUC = {roc_auc:.2f})")
-            
             plt.plot([0, 1], [0, 1], "k--", label="Random Guess")
             plt.xlabel("False Positive Rate")
             plt.ylabel("True Positive Rate")
@@ -296,8 +249,6 @@ def train_cnn_model(model, train_loader, val_loader, full_loader, classes, epoch
             plt.legend(loc="best")
             st.pyplot(plt)
             plt.close()
-
-            # Display prediction results
             prediction_results = pd.DataFrame({
                 "Image Path": val_image_paths,
                 "True Label": [classes[label] for label in val_labels],
@@ -305,14 +256,11 @@ def train_cnn_model(model, train_loader, val_loader, full_loader, classes, epoch
                 "Confidence": [max(prob) for prob in val_probabilities]
             })
             st.write(f"\nPrediction Results for Validation Set (Epoch {epoch+1}):")
-            st.dataframe(prediction_results.head(10))  # Show top 10 predictions
-
-        # Compute metrics on the whole dataset
+            st.dataframe(prediction_results.head(10))
         st.write("\nEvaluating on the entire dataset...")
         model.eval()
         full_predictions = []
         full_labels = []
-        
         with torch.no_grad():
             for images, labels, _ in full_loader:
                 images, labels = images.to(device), labels.to(device)
@@ -320,14 +268,10 @@ def train_cnn_model(model, train_loader, val_loader, full_loader, classes, epoch
                 _, predicted = torch.max(outputs.data, 1)
                 full_predictions.extend(predicted.cpu().numpy())
                 full_labels.extend(labels.cpu().numpy())
-        
-        # Compute evaluation metrics for the whole dataset
         full_accuracy = accuracy_score(full_labels, full_predictions)
         full_precision = precision_score(full_labels, full_predictions, average='weighted', zero_division=0)
-        full_recall = recall_score(full_labels, full_predictions, average='weighted', zero_division=0)
-        full_f1 = f1_score(full_labels, full_predictions, average='weighted', zero_division=0)
-        
-        # Display metrics in a clearly labeled section
+        full_recall = recall_score(full_labels, full_predictions, average='weighted')
+        full_f1 = f1_score(full_labels, full_predictions, average='weighted')
         st.subheader("📊 Metrics for the Entire Dataset")
         st.markdown("""
         Metrics for the Entire Dataset:  
@@ -336,40 +280,29 @@ def train_cnn_model(model, train_loader, val_loader, full_loader, classes, epoch
         Recall: {:.4f}  
         F1 Score: {:.4f}
         """.format(full_accuracy, full_precision, full_recall, full_f1))
-
-        # Save the trained model
         torch.save(model.state_dict(), "trained_cnn_model.pth")
         st.success("Training completed and model saved as 'trained_cnn_model.pth'!")
     except Exception as e:
         st.error(f"Training failed: {str(e)}")
 
-# X-ray analysis
 def analyze_xray(image: Image.Image, suspected_disease: str = None) -> dict:
     try:
-        # Preprocess for BLIP
         image_blip = image.convert("L").resize((224, 224), Image.Resampling.LANCZOS)
         img_np = np.array(image_blip)
         img_np = cv2.equalizeHist(img_np)
         image_blip = Image.fromarray(img_np)
-
-        # BLIP description
         inputs = processor(images=image_blip, return_tensors="pt").to(device)
         inputs["pixel_values"] = inputs["pixel_values"].to(torch.float32)
         out = blip_model.generate(**inputs, max_length=75, num_beams=5)
         description = processor.decode(out[0], skip_special_tokens=True)
-
-        # BLIP classification
         classes = ["0Normal", "1Doubtful", "2Mild", "3Moderate", "4Severe"]
         prompt = f"Classify this X-ray image as one of: {', '.join(classes)}. Description: {description}"
         if suspected_disease and suspected_disease != "None":
             prompt += f" Suspected condition: {suspected_disease}."
-        
         classification_inputs = processor(text=prompt, images=image_blip, return_tensors="pt").to(device)
         classification_out = blip_model.generate(**classification_inputs, max_new_tokens=10)
         blip_predicted_class = processor.decode(classification_out[0], skip_special_tokens=True).strip()
         blip_confidence = 0.9 if blip_predicted_class in classes else 0.5
-
-        # CNN classification
         image_tensor = cnn_transform(image).unsqueeze(0).to(device)
         with torch.no_grad():
             outputs = cnn_model(image_tensor)
@@ -377,7 +310,6 @@ def analyze_xray(image: Image.Image, suspected_disease: str = None) -> dict:
             cnn_predicted_idx = torch.argmax(probabilities, dim=1).item()
             cnn_confidence = probabilities[0, cnn_predicted_idx].item()
         cnn_predicted_class = classes[cnn_predicted_idx]
-
         torch.mps.empty_cache()
         return {
             "description": description,
@@ -392,7 +324,6 @@ def analyze_xray(image: Image.Image, suspected_disease: str = None) -> dict:
         st.error(f"X-ray analysis failed: {e}")
         return {}
 
-# Grad-CAM implementation
 def apply_gradcam(image_tensor, model, target_class):
     try:
         model.eval()
@@ -400,10 +331,8 @@ def apply_gradcam(image_tensor, model, target_class):
         features = model.features(image_tensor)
         pooled = F.adaptive_avg_pool2d(features, (1, 1))
         output = model.classifier(pooled.view(image_tensor.size(0), -1))
-        
         model.zero_grad()
         output[0, target_class].backward()
-        
         gradients = image_tensor.grad.detach()
         weights = torch.mean(gradients, dim=[2, 3], keepdim=True)
         cam = torch.sum(weights * features, dim=1, keepdim=True)
@@ -411,7 +340,6 @@ def apply_gradcam(image_tensor, model, target_class):
         cam = F.interpolate(cam, size=(224, 224), mode='bilinear', align_corners=False)
         cam = cam - cam.min()
         cam = cam / (cam.max() + 1e-8)
-        
         cam_np = cam.squeeze().detach().cpu().numpy()
         image_np = image_tensor.squeeze().detach().cpu().numpy()
         plt.imshow(image_np, cmap="gray", alpha=0.5)
@@ -425,7 +353,6 @@ def apply_gradcam(image_tensor, model, target_class):
         st.warning(f"Grad-CAM failed: {e}")
         return None
 
-# SHAP implementation
 def apply_shap(image_tensor, model):
     try:
         model.eval()
@@ -433,7 +360,6 @@ def apply_shap(image_tensor, model):
         baseline = torch.zeros_like(image_tensor).to(device)
         image_tensor = image_tensor.clone().detach().requires_grad_(True).to(device)
         attributions = gradient_shap.attribute(image_tensor, baselines=baseline, target=0)
-        
         attr_np = attributions.squeeze().detach().cpu().numpy()
         image_np = image_tensor.squeeze().detach().cpu().numpy()
         plt.imshow(np.abs(attr_np), cmap="viridis", alpha=0.5)
@@ -447,31 +373,56 @@ def apply_shap(image_tensor, model):
         st.warning(f"SHAP failed: {e}")
         return None
 
-# LIME implementation
+
 def apply_lime(image, model, classes):
     try:
         explainer = LimeImageExplainer()
         def predict_fn(images):
-            images = torch.tensor(images, dtype=torch.float32).permute(0, 3, 1, 2).to(device)
-            images = images / 255.0
+            images = torch.tensor(images, dtype=torch.float32).permute(0, 3, 1, 2).to(device)  # [N, C, H, W]
+            images = images.mean(dim=1, keepdim=True)  # Convert RGB to grayscale: [N, 1, H, W]
+            images = (images - 0.5) / 0.5  # Normalize to match cnn_transform
             with torch.no_grad():
                 outputs = model(images)
             return F.softmax(outputs, dim=1).cpu().numpy()
         
         image_np = np.array(image.convert("L").resize((224, 224)))
-        explanation = explainer.explain_instance(image_np, predict_fn, top_labels=2, num_samples=500)
-        temp, mask = explanation.get_image_and_mask(explanation.top_labels[0], positive_only=True)
-        plt.imshow(temp, cmap="gray")
+        image_rgb = np.stack([image_np] * 3, axis=-1)
+        
+        explanation = explainer.explain_instance(
+            image_rgb,
+            predict_fn,
+            top_labels=2,
+            num_samples=500,
+            segmentation_fn=None
+        )
+        
+        temp, mask = explanation.get_image_and_mask(
+            explanation.top_labels[0],
+            positive_only=True,
+            num_features=5,
+            hide_rest=False
+        )
+        
+        plt.figure(figsize=(6, 6))
+        plt.imshow(image_np, cmap="gray", alpha=0.5)
+        plt.imshow(mask, cmap="viridis", alpha=0.5)
+        
+        cbar = plt.colorbar(label="Importance (Positive Contribution)")
+        cbar.set_label("Superpixel Importance", fontsize=10)
+        
+        plt.xlabel("X (pixels)", fontsize=10)
+        plt.ylabel("Y (pixels)", fontsize=10)
+        plt.xticks(fontsize=8)
+        plt.yticks(fontsize=8)
+        
         lime_path = f"lime_{uuid.uuid4().hex}.png"
-        plt.axis("off")
-        plt.savefig(lime_path, bbox_inches="tight")
+        plt.savefig(lime_path, bbox_inches="tight", dpi=150)
         plt.close()
+        
         return lime_path
     except Exception as e:
-        st.warning(f"LIME failed: {e}")
+        st.warning(f"LIME failed: {str(e)}")
         return None
-
-# Feature visualization (Edge detection)
 def visualize_xray_features(image):
     try:
         img_np = np.array(image.convert("L").resize((224, 224)))
@@ -486,7 +437,6 @@ def visualize_xray_features(image):
         st.warning(f"Feature visualization failed: {e}")
         return None
 
-# Prompt template
 EFFICIENT_PROMPT_TEMPLATE = """
 As a board-certified radiologist with 20+ years of experience, analyze this X-ray image with description: {caption}
 Additional patient context: {context}
@@ -520,7 +470,6 @@ Generate a comprehensive disease analysis with:
 Format using markdown with clear headings. Be concise but thorough.
 """
 
-# LangChain query
 def query_langchain(description: str, predicted_class: str, confidence: float, user_context: str) -> str:
     try:
         chat = ChatGroq(
@@ -547,7 +496,6 @@ def query_langchain(description: str, predicted_class: str, confidence: float, u
         st.error(f"LLM analysis failed: {e}")
         return ""
 
-# PDF generation
 class MedicalPDF(FPDF):
     def __init__(self, patient_info=""):
         super().__init__()
@@ -672,7 +620,6 @@ class MedicalPDF(FPDF):
             self.cell(0, 8, "LIME (Superpixel Importance):", 0, 1)
             self.image(lime_path, w=90)
 
-# Gradient text
 def gradient_text(text, color1, color2):
     return f"""
     <style>
@@ -686,12 +633,10 @@ def gradient_text(text, color1, color2):
     <div class="gradient-text">{text}</div>
     """
 
-# UI setup
 st.markdown(gradient_text("XrayScan AI", "#4CAF50", "#2196F3"), unsafe_allow_html=True)
 st.markdown("### AI-Powered X-ray Disease Detection")
 st.markdown("**Disclaimer**: This tool is for educational purposes only. Consult a radiologist for medical diagnosis.")
 
-# Sidebar
 with st.sidebar:
     st.header("About")
     st.markdown("""
@@ -721,11 +666,9 @@ with st.sidebar:
             with st.spinner("Training model..."):
                 st.write("Starting training with 1 epoch...")
                 train_cnn_model(cnn_model, train_loader, val_loader, full_loader, classes, epochs=1, verbose=True)
-                # Reload the model to use the newly trained weights
-                st.session_state.clear()  # Clear cache to reload model
+                st.session_state.clear()
                 st.rerun()
 
-# Image input
 col1, col2 = st.columns([3, 2])
 with col1:
     img_file = st.file_uploader("Upload X-ray Image", type=["jpg", "jpeg", "png"], key="image_uploader")
@@ -740,14 +683,13 @@ with col2:
     if image:
         st.image(image, caption="Preview", use_column_width=True)
 
-# Clinical context
 with st.expander("➕ Additional Clinical Context"):
     user_context = st.text_area(
         "Patient Information",
         placeholder="Age, symptoms duration, medical history, current medications...",
         height=100
     )
-    user_context = re.sub(r'[^\x00-\x7F<>{}]', '', user_context)  # Sanitize input
+    user_context = re.sub(r'[^\x00-\x7F<>{}]', '', user_context)
     clinical_factors = st.multiselect(
         "Relevant Factors",
         ["Smoking History", "Recent Trauma", "Chronic Cough", "Fever", "Immunocompromised"],
@@ -759,29 +701,24 @@ with st.expander("➕ Additional Clinical Context"):
         help="Select if the X-ray is related to a specific condition."
     )
 
-# Analysis and report generation
 col1, col2 = st.columns(2)
 with col1:
     if st.button("Analyze with XrayScan AI", type="primary", use_container_width=True, key="analyze_button"):
         if not image:
             st.warning("Please upload an X-ray image.")
             st.stop()
-
         with st.spinner("Processing X-ray with AI..."):
             progress_bar = st.progress(0)
             progress_bar.progress(20, text="Analyzing X-ray features")
             result = analyze_xray(image, suspected_disease)
-            
             if not result:
                 st.error("X-ray analysis failed.")
                 st.stop()
-
             progress_bar.progress(40, text="Generating explainability visualizations")
             edge_path = visualize_xray_features(image)
             gradcam_path = apply_gradcam(result["image_tensor"], cnn_model, result["cnn_predicted_idx"])
             shap_path = apply_shap(result["image_tensor"], cnn_model)
             lime_path = apply_lime(image, cnn_model, ["0Normal", "1Doubtful", "2Mild", "3Moderate", "4Severe"])
-            
             progress_bar.progress(60, text="Correlating with clinical data")
             report = query_langchain(
                 result["description"],
@@ -789,7 +726,6 @@ with col1:
                 result["cnn_confidence"],
                 user_context
             )
-            
             progress_bar.progress(90, text="Formatting report")
             with st.container():
                 st.subheader("🔬 X-ray Disease Analysis")
@@ -806,14 +742,16 @@ with col1:
                         st.markdown(report.split("4. **Clinical Considerations**")[1])
                 with tab4:
                     if edge_path:
-                        st.image(edge_path, caption="Edge Detection: Key Radiographic Features")
+                        st.image(edge_path, caption="Edge Detection: Key Radiographic Features", use_column_width=True)
                     if gradcam_path:
-                        st.image(gradcam_path, caption="Grad-CAM: Class Activation Map")
+                        st.image(gradcam_path, caption="Grad-CAM: Class Activation Map", use_column_width=True)
                     if shap_path:
-                        st.image(shap_path, caption="SHAP: Pixel Importance")
+                        st.image(shap_path, caption="SHAP: Pixel Importance", use_column_width=True)
                     if lime_path:
-                        st.image(lime_path, caption="LIME: Superpixel Importance")
-            
+                        st.image(lime_path, caption="LIME: Superpixel Importance with Scale", use_column_width=True)
+                        st.markdown("""
+                        **LIME Explanation**: This visualization highlights regions of the X-ray that contribute most to the model's prediction. Yellow areas indicate high importance, while dark purple areas indicate lower importance. The colorbar shows the scale of superpixel importance.
+                        """)
             st.session_state.report_data = {
                 "image": image,
                 "report": report,
@@ -843,7 +781,6 @@ with col2:
                 pass
         st.rerun()
 
-# PDF report
 if 'report_data' in st.session_state:
     st.divider()
     st.subheader("Report Options")
@@ -855,36 +792,30 @@ if 'report_data' in st.session_state:
                 pdf.cover_page()
                 pdf.add_summary(st.session_state.report_data["report"])
                 pdf.table_of_contents()
-                
                 tmp_path = os.path.join(tmp_dir, f"image_{uuid.uuid4().hex}.jpg")
                 st.session_state.report_data["image"].save(tmp_path, quality=90)
                 pdf.add_image(tmp_path)
-                
                 report = st.session_state.report_data["report"]
                 sections = [
                     ("Clinical Findings", report.split("2. **Detailed Analysis**")[0]),
                     ("Detailed Analysis", report.split("2. **Detailed Analysis**")[1].split("3. **Evidence-Based Recommendations**")[0] if "2. **Detailed Analysis**" in report else ""),
                     ("Treatment Plan", report.split("3. **Evidence-Based Recommendations**")[1] if "3. **Evidence-Based Recommendations**" in report else "")
                 ]
-                
                 for title, body in sections:
                     if body.strip():
                         pdf.add_section(title, body)
-                
                 pdf.add_explainability(
                     st.session_state.report_data["edge_path"],
                     st.session_state.report_data["gradcam_path"],
                     st.session_state.report_data["shap_path"],
                     st.session_state.report_data["lime_path"]
                 )
-                
                 pdf_output = pdf.output(dest="S").encode('latin1')
                 b64 = base64.b64encode(pdf_output).decode('latin1')
                 href = f'<a href="data:application/pdf;base64,{b64}" download="XrayScan_Report_{datetime.now().strftime("%Y%m%d_%H%M%S")}.pdf">📥 Download Your Report</a>'
                 st.markdown(href, unsafe_allow_html=True)
                 st.success("PDF report generated successfully!")
 
-# Footer
 st.markdown("---")
 st.markdown(
     "<p style='text-align: center;'>Built with ❤️ by <b>Ujjwal Sinha</b> • "
@@ -892,5 +823,4 @@ st.markdown(
     unsafe_allow_html=True
 )
 
-# Memory cleanup
 torch.mps.empty_cache()
