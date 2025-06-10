@@ -1,22 +1,17 @@
-torch==2.4.1
-torchvision==0.19.1
+streamlit==1.38.0
 pillow==10.4.0
+opencv-python-headless==4.10.0.84
 numpy==1.26.4
-matplotlib==3.9.2
-seaborn==0.13.2
-scikit-learn==1.5.2
-opencv-python==4.10.0.84
-lime==0.2.0.1
-shap==0.46.0
-streamlit==1.39.0
-fpdf==1.7.2
-transformers==4.45.2
+transformers==4.44.2
+langchain==0.3.0
 langchain-groq==0.2.0
-langchain-core==0.3.58  # Updated to satisfy langchain and langchain-text-splitters
-langchain==0.3.25  # Explicitly pin to match installed version
-langchain-text-splitters==0.3.8  # Explicitly pin to match installed version
+torch==2.4.1+cpu -f https://download.pytorch.org/whl/cpu/torch_stable.html
+torchvision==0.19.1+cpu -f https://download.pytorch.org/whl/cpu/torch_stable.html
+fpdf2==2.7.9
+matplotlib==3.9.2
+pandas==2.2.2
+scikit-learn==1.5.1
+seaborn==0.13.2
+lime==0.2.0.1
+captum==0.7.0
 python-dotenv==1.0.1
-pydantic==2.10.1
-pydantic-settings==2.6.1
-retry
-captum
