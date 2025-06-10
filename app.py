@@ -33,8 +33,9 @@ import seaborn as sns
 
 st.set_page_config(page_title="XrayScan AI", layout="centered", page_icon="🔍")
 
-device = torch.device("mps" if torch.backends.mps.is_available() else "cpu")
-st.write(f"Using device: {device}")
+# Initialize device
+device = torch.device("cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu")
+st.write(f"Using device: {device}, CUDA available: {torch.cuda.is_available()}, MPS available: {torch.backends.mps.is_available()}")
 
 load_dotenv()
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
@@ -45,8 +46,9 @@ if not GROQ_API_KEY:
 @st.cache_resource
 def load_blip_models():
     try:
-        processor = BlipProcessor.from_pretrained("Salesforce/blip-image-captioning-large")
-        model = BlipForConditionalGeneration.from_pretrained("Salesforce/blip-image-captioning-large").to(device)
+        # Use 'base' model for lower memory usage; switch to 'large' if needed
+        processor = BlipProcessor.from_pretrained("Salesforce/blip-image-captioning-base")
+        model = BlipForConditionalGeneration.from_pretrained("Salesforce/blip-image-captioning-base").to(device)
         return processor, model
     except Exception as e:
         st.error(f"Failed to load BLIP models: {e}")
@@ -60,13 +62,15 @@ if not processor or not blip_model:
 @st.cache_resource
 def load_cnn_model():
     try:
-        model = models.densenet121(weights="IMAGENET1K_V1")
+        model = models.densenet121(weights=None)  # Fallback to no pre-trained weights
         model.features.conv0 = torch.nn.Conv2d(1, 64, kernel_size=7, stride=2, padding=3, bias=False)
         model.classifier = torch.nn.Linear(model.classifier.in_features, 5)
         model = model.to(device).eval()
         if os.path.exists("trained_cnn_model.pth"):
             model.load_state_dict(torch.load("trained_cnn_model.pth", map_location=device))
             st.info("Loaded pre-trained model weights from 'trained_cnn_model.pth'.")
+        else:
+            st.warning("Pre-trained model weights not found. Using untrained model.")
         return model
     except Exception as e:
         st.error(f"Failed to load CNN model: {e}")
@@ -142,16 +146,17 @@ class KneeXrayDataset(Dataset):
 
 def load_knee_xray_dataset():
     try:
-        dataset_path = "Dataset/KneeXray"
-        csv_file = "Dataset/Digital Knee X-ray Images.csv"
+        # Use relative paths for deployment
+        dataset_path = os.path.join(os.path.dirname(__file__), "Dataset/KneeXray")
+        csv_file = os.path.join(os.path.dirname(__file__), "Dataset/Digital Knee X-ray Images.csv")
         dataset = KneeXrayDataset(csv_file=csv_file, root_dir=dataset_path, transform=cnn_transform)
         indices = list(range(len(dataset)))
         train_indices, val_indices = train_test_split(indices, test_size=0.2, random_state=42)
         train_dataset = Subset(dataset, train_indices)
         val_dataset = Subset(dataset, val_indices)
-        train_loader = DataLoader(train_dataset, batch_size=16, shuffle=True)
-        val_loader = DataLoader(val_dataset, batch_size=16, shuffle=False)
-        full_loader = DataLoader(dataset, batch_size=16, shuffle=False)
+        train_loader = DataLoader(train_dataset, batch_size=8, shuffle=True)  # Reduced batch size
+        val_loader = DataLoader(val_dataset, batch_size=8, shuffle=False)
+        full_loader = DataLoader(dataset, batch_size=8, shuffle=False)
         return train_loader, val_loader, full_loader, len(dataset), len(train_dataset), len(val_dataset), dataset.classes
     except Exception as e:
         st.error(f"Failed to load dataset: {str(e)}")
@@ -310,7 +315,11 @@ def analyze_xray(image: Image.Image, suspected_disease: str = None) -> dict:
             cnn_predicted_idx = torch.argmax(probabilities, dim=1).item()
             cnn_confidence = probabilities[0, cnn_predicted_idx].item()
         cnn_predicted_class = classes[cnn_predicted_idx]
-        torch.mps.empty_cache()
+        # Clear memory only if GPU is available
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        elif torch.backends.mps.is_available():
+            torch.mps.empty_cache()
         return {
             "description": description,
             "blip_prediction": blip_predicted_class,
@@ -373,56 +382,48 @@ def apply_shap(image_tensor, model):
         st.warning(f"SHAP failed: {e}")
         return None
 
-
 def apply_lime(image, model, classes):
     try:
         explainer = LimeImageExplainer()
         def predict_fn(images):
-            images = torch.tensor(images, dtype=torch.float32).permute(0, 3, 1, 2).to(device)  # [N, C, H, W]
-            images = images.mean(dim=1, keepdim=True)  # Convert RGB to grayscale: [N, 1, H, W]
-            images = (images - 0.5) / 0.5  # Normalize to match cnn_transform
+            images = torch.tensor(images, dtype=torch.float32).permute(0, 3, 1, 2).to(device)
+            images = images.mean(dim=1, keepdim=True)
+            images = (images - 0.5) / 0.5
             with torch.no_grad():
                 outputs = model(images)
             return F.softmax(outputs, dim=1).cpu().numpy()
-        
         image_np = np.array(image.convert("L").resize((224, 224)))
         image_rgb = np.stack([image_np] * 3, axis=-1)
-        
         explanation = explainer.explain_instance(
             image_rgb,
             predict_fn,
             top_labels=2,
-            num_samples=500,
+            num_samples=100,  # Reduced for CPU
             segmentation_fn=None
         )
-        
         temp, mask = explanation.get_image_and_mask(
             explanation.top_labels[0],
             positive_only=True,
             num_features=5,
             hide_rest=False
         )
-        
         plt.figure(figsize=(6, 6))
         plt.imshow(image_np, cmap="gray", alpha=0.5)
         plt.imshow(mask, cmap="viridis", alpha=0.5)
-        
         cbar = plt.colorbar(label="Importance (Positive Contribution)")
         cbar.set_label("Superpixel Importance", fontsize=10)
-        
         plt.xlabel("X (pixels)", fontsize=10)
         plt.ylabel("Y (pixels)", fontsize=10)
         plt.xticks(fontsize=8)
         plt.yticks(fontsize=8)
-        
         lime_path = f"lime_{uuid.uuid4().hex}.png"
         plt.savefig(lime_path, bbox_inches="tight", dpi=150)
         plt.close()
-        
         return lime_path
     except Exception as e:
         st.warning(f"LIME failed: {str(e)}")
         return None
+
 def visualize_xray_features(image):
     try:
         img_np = np.array(image.convert("L").resize((224, 224)))
@@ -490,7 +491,11 @@ def query_langchain(description: str, predicted_class: str, confidence: float, u
             "confidence": confidence,
             "context": user_context or "None provided"
         })
-        torch.mps.empty_cache()
+        # Clear memory only if GPU is available
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        elif torch.backends.mps.is_available():
+            torch.mps.empty_cache()
         return result
     except Exception as e:
         st.error(f"LLM analysis failed: {e}")
@@ -668,6 +673,11 @@ with st.sidebar:
                 train_cnn_model(cnn_model, train_loader, val_loader, full_loader, classes, epochs=1, verbose=True)
                 st.session_state.clear()
                 st.rerun()
+    st.divider()
+    st.subheader("Explainability Options")
+    use_gradcam = st.checkbox("Enable Grad-CAM", value=True)
+    use_shap = st.checkbox("Enable SHAP", value=True)
+    use_lime = st.checkbox("Enable LIME", value=False)
 
 col1, col2 = st.columns([3, 2])
 with col1:
@@ -716,9 +726,9 @@ with col1:
                 st.stop()
             progress_bar.progress(40, text="Generating explainability visualizations")
             edge_path = visualize_xray_features(image)
-            gradcam_path = apply_gradcam(result["image_tensor"], cnn_model, result["cnn_predicted_idx"])
-            shap_path = apply_shap(result["image_tensor"], cnn_model)
-            lime_path = apply_lime(image, cnn_model, ["0Normal", "1Doubtful", "2Mild", "3Moderate", "4Severe"])
+            gradcam_path = apply_gradcam(result["image_tensor"], cnn_model, result["cnn_predicted_idx"]) if use_gradcam else None
+            shap_path = apply_shap(result["image_tensor"], cnn_model) if use_shap else None
+            lime_path = apply_lime(image, cnn_model, ["0Normal", "1Doubtful", "2Mild", "3Moderate", "4Severe"]) if use_lime else None
             progress_bar.progress(60, text="Correlating with clinical data")
             report = query_langchain(
                 result["description"],
@@ -777,8 +787,8 @@ with col2:
         for file in glob.glob("*.png") + glob.glob("*.jpg"):
             try:
                 os.remove(file)
-            except:
-                pass
+            except Exception as e:
+                st.warning(f"Failed to delete file {file}: {e}")
         st.rerun()
 
 if 'report_data' in st.session_state:
@@ -822,5 +832,3 @@ st.markdown(
     "<a href='https://github.com/Ujjwal-sinha' target='_blank'>GitHub</a></p>",
     unsafe_allow_html=True
 )
-
-torch.mps.empty_cache()
